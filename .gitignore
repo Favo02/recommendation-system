@@ -1,0 +1,11 @@
+# environment
+spark
+dataset
+.ipynb_checkpoints
+
+# secrets
+.env
+
+# various
+tests.ipynb
+TODO.md
