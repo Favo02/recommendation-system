@@ -1,224 +1,345 @@
 #import "@preview/rubber-article:0.5.2": *
+#import "@preview/equate:0.3.2": equate
 
+#show ref: underline
+#show link: underline
+
+#show: equate.with(sub-numbering: true)
 #show: article.with(
-  eq-chapterwise: true,
+  eq-chapterwise: false,
+  eq-numbering: "(1.1)",
   header-display: true,
   lang: "en",
   page-paper: "a4",
   heading-numbering: "1.1.",
 )
 
-// Frontmatter
+#let note = content => box(stroke: gray, inset: 0.8em, width: 100%)[
+  _Note:_ #content
+]
+
+#let comment = content => text(size: 8pt)[(#content)]
+
 #maketitle(
   title: "Nyt Articles & Comments (2020): A Content-Based Recommendation System",
   authors: ("Luca Favini",),
   date: datetime.today().display("[day]. [month repr:long] [year]"),
 )
 
-// [ ] correctness of the general methodological approach,
-// [ ] replicability of the experiments,
-// [ ] correctness of the approach,
-// [ ] scalability of the proposed solution,
-// [ ] clarity of exposition.
+#align(center)[
+  Algorithms for Massive Datasets -- Final Project
 
-// [x] the considered version of the dataset (in terms of access date, as the dataset might be updated frequently), and the parts of the latter which have been considered,
-// [x] how data have been organized,
-// [x] the applied pre-processing techniques,
-// [x] the considered algorithms and their implementations,
-// [x] how the proposed solution scales up with data size,
-// [x] a description of the experiments,
-// [x] comments and discussion on the experimental results.
+  Università degli Studi di Milano -- Master degree in Computer Science
+]
 
 #abstract(width: 70%, alignment: center)[
-  This project contains an Apache Spark implementation of a content-based recommendation system for articles in the _New York Times Articles & Comments (2020)_ dataset.
-  Users and articles are encoded as a vector of features.
-  Similar users and articles are computed, using cosine similarity.
-  Because of size of the dataset, the user-article pairs are filtered using LSH.
+  The project implements a *content-based* recommendation system for news articles using the _New York Times Articles & Comments (2020)_ dataset.
+  User interests are inferred from their *commenting behavior*, and both users and articles are represented as *feature vectors* based on article metadata (newsdesk, section, keywords) and comment history.
+  To efficiently identify similar user-article pairs from billions of potential comparisons, the system uses Local Sensitive Hashing (*LSH*) with random *hyperplane sketches*, followed by *cosine similarity* calculation.
+  The implementation leverages *Apache Spark* for distributed processing, enabling scalability to massive datasets.
+  Results show the approach generates high-quality recommendations for focused user profiles, with poorer performance for noisy user profiles.
 ]
 
 = Dataset
 
-The dataset, _New York Times Articles & Comments (2020)_, found on Kaggle (version 6, downloaded on 10 March 2026 @NytArticlesCommentsDataset) contains all the *articles* published in 2020, alogn with all the *comments* left on those articles.
+The _New York Times Articles & Comments (2020)_ @NytArticlesCommentsDataset dataset contains all articles published in 2020 and all comments left on those articles during the year.
+The version 6 of the dataset was downloaded from Kaggle on March 10, 2026.
+It contains approximately $15,000$ article records and $5,000,000$ comments.
 
-- for articles, the only information used is newsdesk, section, subsection, keywords
-- this information was used to build a profile on what topics the article covers
-- if the dataset included the whole body of the article, an idea could be to extract manually the topics of the article, for instance with techniques like TF.IDF
+== Preprocessing
 
-- these articles must be recommended to users, so also a user profile is needed
-- because there isn't any information on the users, it is all inferred by the comments left by the users on the articles
-- so the only information kept from comments file is the association between a user and an article (more on that in section Method > Utility Matrix)
+For each record, the dataset contains various information.
+Once loaded, the dataset is preprocessed to discard all the fields not used by the system.
+Specifically:
 
-- the artciles are in a single file with ~16k articles (all loaded and processed)
-- the comments are already divided in files with ~500k commente each, only one of these files is processed (subsampling for keeping the running time reasonable)
-- there is also a parameter for subsampling the dataset
+/ Articles data: Only the _newsdesk_, _section_, _subsection_, and _keywords_, beyond the _articleID_, are kept.
+  These describe the article's topic, the first three organize articles in a hierarchy in the New York Times website, while keywords are specific topic tags added by the editors.
+  The keyword field comes as a text list like `['keyword1', 'keyword2', ...]`, and it is parsed into a real list.
 
-- preprocessing: all useless columns dropped
-- the title and abstract, used for human evaluation and then re-joined with the article id after the whole recommendation calculation
-- the keywords field is a list of tags encoded as a string, so it is preprocessed by being parsed back to an actual list of strings
+/ Comments data: These are used to infer the users behaviour and interest.
+  Only the _articleID_, the article on which the comment was left, and _userID_, the user that commented, are kept.
+
+#vspace
+
+This information is used to build profiles that describe _articles_ and _users_.
+More on that in @utility-matrix and @profiles.
+
+== Subsampling
+
+To keep the computation time reasonable, a subsampling system is implemented.
+By default, only a part of the comments is used, loading a smaller file with $500,000$ comments.
+Furthermore, both articles and comments can be subsampled using Spark primitives by tweaking the configuration (@parameters).
+
+#note[
+  From now on, it is assumed the default parameters are used: smaller comments file with no further subsampling.
+]
 
 = Method
 
-== Utility Matrix
+The general pipeline for performing recommendations is:
+- Build the utility matrix, mapping interactions between users and articles
+- Build profiles for users and articles based on the utility matrix and article metadata
+- Find similar user-article pairs based on cosine similarity:
+  - Compress profiles into sketches using random hyperplanes
+  - Use LSH to find candidate pairs of user-article that are similar enough to be recommended
+  - Compute the actual cosine similarity for each candidate pair and select the top recommendations for each user
 
-- as said above, there is not explicit information on wheter a user liked (or even just read) an article
-- so the matrix is build by putting to 1 the entries where a user interacted with an article, resulting in a binary matrix (for this, just use the comments datafile)
-- multiple comments on the same article (from the same user, of course) are discarded as do not hold many importance, the idea is that a heated discussion does not mean the user is really more interested in an article
+== Utility Matrix Construction <utility-matrix>
 
-== Building Profiles
+The dataset does not have explicit ratings from users, but this information is needed when dealing with recommendations.
+To fill this hole, the assumption that if a user comments on an article, they are interested in that topic is made.
+This is reasonable: users spend time commenting on articles that interest them.
 
-- profiles are a vector representation of the topics an article is about / an user is interested in
-- each entry of the vector corresponds to a feature (one of newsdesk, section, subsection and keywords)
-- building the profiles is achieved with two approaches: dictionary and hashing
+A simple matrix $M in RR^(|U| times |A|)$ is created that shows which user commented on which article, where $|U|$ is the number of users and $|A|$ is the number of articles.
+$
+  M_(u, a) = cases(
+    1 quad & "if" u "commented" a,
+    0 quad & "otherwise"
+  )
+$
+The matrix is very sparse, on average each user interacted with $4$ articles.
 
-=== Features Dictionary
+#vspace
 
-- so the size of the vector is the sum of all the distinct newsdesk, section, subsection, keywords
-- because of the abundace of kwywords (~15000), the ones used really few times (e.g. < 5) are discarded (result: ~5000)
-  - TODO: source of that pruning? the idea is these keywords give a few information, we recommend based on the other more frequent ones
-- then a dictionary mapping the feature name to an index is build for easy conversion
-- pros: each feature is identified by a single index in the vector
-- pros: given a profile, you can go back to wheter feature that is referred to
-- contro: when new features are added (e.g. by a new article), the vector need to be extended (and so recomputed)
-- contro: the vector could grow to infinite size
+/ Duplicate removal: Multiple comments on the same article from the same user are treated as just one interaction.
+  Commenting many times does not hold value, intuitively heated discussions does not mean more interest and bring additional complexity.
 
-=== Features Hashing
+== Profile Representation <profiles>
 
-- instead of mapping each feature (newsdesk, section, subsection, keyword) to a index, we hash it and then put to `1` the bucket they ended up
-- the profile is now a fixed size vector (the number of buckets of the hash)
-- pros: faster to compute (no need to compute the dictionary)
-- pros: new features handled like the old ones, just hash
-- contro: no way to determine a `1` in the profile to what feature is referred (no way to navigate back an hash function)
-- contro: collisions, as there are more distinc features than buckets, there must be collisions, multiple features to the same bucket
-- contro/pro: we dont care about collisions
+Each _article_ and _user_ is represented as a vector, where each dimension of the vector corresponds to one feature.
+These features come primary from two sets:
+- _Structural_: newsdesk, section, subsection (fewer than 200 different values total)
+- _Keywords_: about 15,000 different keywords
 
-=== Article and User Profiles
+#note[
+  Another idea would be to use indexes like TF.IDF to extract the features of articles.
+  Without full article body, this is not very feasible.
+]
 
-- article profiles are boolean: 1 wher the feature is on for that article, 0 where not
-- user profiles are build by counting the number of articles commented for that feature by the user, so these are not boolean but integer positive numbers
-- no need to normalize the user vectors because the distance used after (more in cosine similarity section) does not depend on that ([20,5] == [4,1])
+_Articles_ have trivial boolean vectors (just 1 or 0 for each feature) based on their categories.
+_User_ profiles are slightly more complex: each component counts how many times that feature appears across articles the user commented.
+User profiles are thus vectors of positive integers.
 
-== Similarity
+#note[
+  Normalizing user profiles (making the entries a probability distribution) does not give any advantage, for the cosine similarity (described in @similarity) the vector and the normalized vector are equal.
+]
 
-- once all profiles are built the task is simply to find article profiles that are similar to user profiles, these will be our suggestions
-- beceause of the amount of data, we cannot do a trivial n^2 approach, so we use LSH
-- first of all we need a compressed version of the profiles (like the signature seen during the course)
+Each profile can be encoded in two ways: using a _dictionary_ or using a _hash function_.
 
-=== Profile Sketches
+#vspace
 
-- a sketch is the generic term for a signature (the signature refers to the minhash, but we dont use minhash)
-- we dont use minhash because it strictly used for binary data (while our user profiles are not binary)
-- so we use the random hyperplane technique:
-  - a random hyperplan is generated (by generating a norm vector)
-  - check wheter the profile is above or below the hyperplane
-  - this check is performed by calculating the dot product
-- 100 hyperplanes are generated and the 100 binary results are the sketch of a profile
+/ Dictionary metod: All the distinc features (both structural and keywords) are collected.
+  Then an indexing dictionary is built for easy conversion from string to vector index.
 
-=== LSH
+  If all keywords are kept, the feature list becomes too large, over $15,000$.
+  Therefore, keywords that appear fewer than 5 times are removed.
+  This brings down the number of features to around $3,500$.
+  The idea behind this is to simplify computation by ignoring rare keywords that do not hold much value for recommendations.
 
-- once the sketches are ready, we can perform LSH, so we divide in bands and rows
-- TODO: calculate r and b parameters, and check wether the results are over treshold t (otherwise are bad results)
-- hash each band and send to a bucket
-- bands of articles and bands of users that end up in the same bucket are candidate similar pairs
-- buckets too big are pruned (ignored)
-  - TODO: justification to this? why simply not increase the number of rows of each band
-- from that, we remove duplicates (can match on multiple bands) and articles users already commented
+  #note[
+    The frequency threshold can be tweaked by changing the `MIN_KW_FREQ` parameter in the configuration (@parameters).
+  ]
 
-=== Actual Similarity: Cosine Similarity
+  The size of this dictionary is approximately $(L_"key" + 4) dot |"features"|$ where $L_"key"$ is the space occupied by the string of the key.
+  For around $3,500$ features, the dictionary is less than $1 "MB"$.
 
-- cosine similarity has been chosen because it is based purely on the direction of the vectors (profiles), ignoring magnitude
-  - euclidean distance: bad because two users that read articles in the same proportion, 20% sport, 80% politics, e.g. [1, 4] and [5, 20] are really distant and so receive different recommendations
-  - jaccard distance: bad because user profiles are not boolean, so a user with 1 comment on sport articles and 100 comments on politics articles receives recommendations both on sport and politics with the same frequency
-- actual similarity computed for all candidates pairs on profiles
-- TODO: make sense to actually calculate the cosine similarity not on the profiles but on the actual features (so that the collision of the hashing approach are addressed), less FP
-- TODO: calculate probability of passing the similarity based on r and b
+  - Advantage: Any feature number can be looked up to determine exactly what it means by building a reversed dictionary.
+  - Disadvantage: If a new article has a keyword not previously seen, the vectors need to be recomputed to accomodate the new feature.
+  - Disadvantage: The size of the dictionary is not bound, it depends on the dataset and it could explode with the number of keywords.
 
-== Performing Recommendations
+#vspace
 
-- with actual similarity, just group by user and sort by similarity
-- the top N articles are suggested to the user
+/ Hashing method: Instead of explicitely building a dictionary, an hash function is applied to a feature to map it to an index (the obtained bucket).
+  By setting an appropriate number of buckets (by default $5,000$), the built profile is granular enough to identify different features.
+
+  #note[
+    The number of buckets can be tweaked by changing the `FEATURES_SIZE` parameter in the configuration (@parameters).
+  ]
+
+  - Advantage: There is no need to store any data structure, only the hash function.
+  - Advantage: New features fit simply by hashing them, no need to recompute anything.
+  - Advantage: No need to prune rarely used keywords.
+  - Disadvantage: There could be collisions (with more distinct features than buckets, there will be), so different features will map to the same index in the profile.
+    These collisions do not pose a big problem as are probably distributed equally among all keywords.
+  - Disadvantage: Impossibility to reverse lookup a profile, an hash function is not navigable back.
+
+#vspace
+
+With a relatively small and fixes number of keywords, the dictionary method is preferable.
+For bigger and constantly updated datasets, the hashing approach is better.
+
+#note[
+  The strategy for building profiles can be tweaked by changing the `PROFILE_STRATEGY` parameter in the configuration (@parameters).
+]
+
+== Finding Similar Users and Articles <similarity>
+
+Once profiles have been computed, the recommendation system needs to find _similar_ pairs of user-article.
+These will become the recommendations.
+
+Comparing every user to every article would require $O(|U| times |A|)$ comparisons.
+With $91,000$ users and $16,000$ articles, this amounts to about $1.5$ billion comparisons, which is computationally infeasible.
+To reduce that complexity, _local sensitive hashing_ (LSH) is used.
+Out of all user-article pairs, only some pass the LSH filter, becoming the candidate pairs.
+
+#vspace
+
+/ Cosine Similarity: The similarity measure used for evaluating similarity is the _cosine similarity_, which measures the angle between the profile vectors:
+  $ "sim"(u, a) = (u dot a) / (||u|| ||a||) $
+  Cosine similarity best fits this application:
+  - _Better than Euclidean distance:_ Euclidean distance considers a user interested in sports 500 times and politics 100 times in a very different way than a user interested in sports 5 times and politics 1 time.
+    But these users share the same preferences.
+  - _Better than Jaccard:_ Jaccard ignores weighted counts.
+    A user interested 500 times in Sports and 1 time about politics is the same of a user interested equal times in sports and politics.
+
+#vspace
+
+/ Compressing the Profile (Sketches):
+  Each profile (user or article) is compressed into a smaller representation, a _sketch_.
+  This is done by checking if the profile is on the positive or negative side of 100 random $D$-dimensionale hyperplanes (each identified by a vector $underline(v) in \{-1, +1\}^D$) in feature space.
+  This can be done by checking the result of the dot product between the profile and the vector $underline(v)$.
+
+  #note[
+    The number of hyperplanes (sketch size) can be tweaked by changing the `LSH_NUM_SKETCHES` parameter in the configuration (@parameters).
+  ]
+
+  #note[
+    Because the vectors are not strictly binary, min-hashing technique is not optimal.
+    Instead, the random hyperplanes technique described above is used.
+    This produces a 100-bit sketch for each user and article.
+  ]
+
+#vspace
+
+/ Finding Candidates Pairs (LSH): The sketches are divided into $b$ bands of $r$ bits.
+  Each band is hashed into a _bucket_.
+  Users and articles that fall in the same bucket are considered candidates for recommendation.
+
+  To calculate the probability of two profiles being in the same bucket, we can use the fact that the probability of two profiles being on the same side of a random hyperplane is related to their cosine similarity.
+
+  #note[
+    Because the vectors are positive, the similarity between a user and an article ranges between $0.0$ and $1.0$, equivalent to angles of $90°$ and $0°$ respectively.
+  ]
+
+  $
+    p = 1 - theta / (180°) quad & #comment[cosine similarity] \
+                  PP = p^r quad & #comment[two profiles are equal in a band of r bits] \
+              PP = 1 - p^r quad & #comment[not matching a full band] \
+          PP = (1 - p^r)^b quad & #comment[not matching all bands] \
+      PP = 1 - (1 - p^r)^b quad & #comment[matching in at least one band]
+  $
+
+  With default parameters of $r = 10$ and $b = 10$, the probability of passing the filter for various similarities $p$ is:
+  - $"sim" = 0.9, space PP approx 0.99 approx 99%$
+  - $"sim" = 0.8, space PP approx 0.67 approx 67%$
+  - $"sim" = 0.7, space PP approx 0.25 approx 25%$
+  - $"sim" = 0.6, space PP approx 0.05 approx 5%$
+  - $"sim" = 0.5, space PP approx 0.009 approx 0.9%$
+
+  This poses the theoretical threshold $t$ (the amount of similarity $p$ where the probability of passing the filter is 50%) at approximately $0.765$.
+  The influence of the filter on the results is further discussed in @results.
+
+#vspace
+
+/ Actual Cosine Similarity:
+  For each pair that passed the LSH filter, the actual cosine similarity is computed to discard False Positives.
+
+#vspace
+
+/ Performing Recommendations: For each user, top 10 articles with highest cosine similarity are selected.
+  Articles the user has already commented are ignored.
 
 = Implementation
 
-In order to elaborate huge datasets, the system is implemented using the PySpark API for Apache Spark.
-The framework uses a MapReduce framework.
+The steps described above are implemented using PySpark, the Python API for Apache Spark.
 
-- everything is encoded by tuples, spark does not enforce (key, value) pairs, but for many operations this will be needed
+== Data Storege: Sparseness
 
-== Setup
+All data is stored in RDDs (Resilient Distributed Dataset) consisting of _sparse_ tuples.
+Spark does not enforce key-value pairs for all operations.
 
-- configuration setup, parameters that can be tweaked in first cell:
+Only non-zero values are stored to conserve memory and permit processing of huge datasets.
+For example, some data strucutes previously described are stored as:
+- Utility matrix: `(article_id, user_id)` pairs
+- Article profiles: `(item_id, (feature_index, weight))` pairs, collected to the dense format `(item_id, [(feature_index1, weight1), ...])` only when stricly necessary (still making sure that the maximum size is limited by the number of features)
+- LSH buckets: `(bucket, item_id)`
 
-- `MIN_KW_FREQ` (deafult `5`): For the dictionary approach (TODO link), only features that appear at least `MIN_KW_FREQ` times will be included in the profiles (for both Users and Articles).
-- `FEATURES_SIZE` (deafult `5000`): For the hashing approach (TODO link), the number buckets of the hash function, in other words, the number of different features.
-- `LSH_NUM_HASHES` (default `100`): number of random hyperplanes (signatures/sketches)
-- `LSH_BANDS` (deafult `10`): play with b and r (calculate the threshold for different values)
-- `LSH_ROWS` (deafult `10`):
-- `LSH_MAX_BUCKET_SIZE` (deafult `500`): maximum number of users/articles in the same bucket
-- `RECOMMENDED_ARTICLES` (deafult `10`): number of articles to recommend to each user
-- `SEED` (default `None`): seed for replicability
+== Spark Broadcasting
 
-== Hash function: mmh3
+Some data strucutes are needed by all Spark nodes, so they need to be broadcasted.
 
-- problems of the built-in hash function:
-  - for strings: each time a new python interpreter starts, it is initialized with a different salt that gets appended to strings
-  - that means that on different nodes of the spark cluster, the same string would get hashed to different digests, breaking the hashing-based feature approach
-- furthermore, the external library provides a better mathematical distribution
+#vspace
 
-== Features dictionary
+/ Features Dictionary: For the dictionary method, the feature mapping must be sent to all worker machines.
+  As calculated above, the order of magniture of this data structure are MB, so the broadcasting is achieved without problems.
+  An alternative approach to that is the hashing method.
 
-- the features dictionary built for the dictionary approach must be broadcasted constructed and then broadcasted to all spark nodes (all need it)
-- when the number of features is limited this is ok (calculation of how many KB broadcasted at max)
-- when the number of features increases, use hashing approach, no broadcast needed at all
+#vspace
 
-== Sparseness
+/ Hyperplanes Broadcasting: To generate sketches for each profile, all nodes need all the norm vector describing the hyperplanes.
+  The dimensionality and the number of each hyperplane is fixed and is, again, in the order of MB.
 
-- because of the high dimensionality of basically everything (utility matrix, profiles, ...) everything is implemented with a sparse approach
-  - profiles: (item_id, (feature_id, quantity)) - quantity is fixed to 1 for article profiles
-  - utility matrix: (article_id, user_id)
+== Hash Functions
 
-== LSH: hyperplanes
+Because of random salting, the python built-in hash function is not consistent across different processes running on different machines.
+This is a problem for the hashing approach: the same feature must be hashed to the same bucket.
+The MurmurHash3 (`mmh3`) library for non-cryptographic hash functions, that provides a seed, is used.
 
-- the hyperplanes need to be known by each node performing lsh hashing, so need to be broadcasted
-- the size and number of hyperplanes is fixed, so the size broadcasted is fixed
+== Lazyness and Caching
 
-== Optimization: Spark Caching
+Spark computes every transformation in a lazy way, everything is recomputed each time a result is requested @SparkCaching.
+If logging is enable (by default it is), at the end of every step, `count` and `take` are called, to have an idea of the amount and structure of the data.
+Then, when that new RDD is used, the whole pipeline is recomputed.
+This is a performance issue, in a production environment, these should be omitted.
 
-- particular attention to shuffling operations, done only where needed
-- due to the lazy nature of spark, each time a "get" operation is done on an rdd, the full pipeline is run and then discarded
-- the rdd used multiple times are cached and unpersisted as soon as they are not needed anymore
-- TODO: lifetimes graph
-- after calculating a step (basically a notebook cell) i run a take() to see the format of the data
-- this runs the pipeline and then discards the result, so a caching before is needed
-- in a production environment, this is not needed, so a few caches can be removed
-- optimization: caching
-  - https://luminousmen.com/post/explaining-the-mechanics-of-spark-caching/
-  - https://luminousmen.com/post/spark-tips-caching
+A possible workaround would be to cache the RDDs and release (`unpersist`) after the use.
+After a few experiment, without performances improvements (the opposite, some OOM failures due to too many cached RDDs), this idea have been dropped.
+Caching has been applied only to RDDs that get actually used multiple times, and are expensive to recompute.
 
-= Scalability
+== Parameters <parameters>
 
-- the current dataset contains a "limited" amount of entries
-- all the implemented operations are ok with handling even bigger datasets:
-  - the only thing that could explode (and give OOM) with bigger datasets is the dictionary approach, where the features needs to be collected (for really really huge datasets)
-  - just use hashing approach instead
-- the things that could suffer are collect and group operations, performed only in:
-  - dictionary approach (replace with hashing)
-  - computing sketches: the user and articles profiles are not sparse anymore but in the form `item_id, [(feature_id, frequency), ...]`
-  - this is not a problem because the number of features of each item is limited (if using the hashing approach)
-  - same thing for actual cosine calculation
-  - in human evaluation, who cares, its just for testing
-- TODO: run on the full dataset (change caching to persist MEMORY and DISK or remove all take)
+The system is configurable by tweaking the parameters defined in the first cell of the notebook:
+- `LOGGING = True`: Enable logging for amount and format of the RDDs (slower performances)
+- `SEED = 25`: Seed of hash and random functions for reproducibility
+- `SAMPLE_SIZE = 0.4`: Fraction of the dataset used (between 0.0 and 1.0)
+- `PROFILE_STRATEGY = "dict"`: Strategy for building profiles, either "dict" or "hash"
+- `MIN_KW_FREQ = 5`: Minimum frequency of keywords to be included in the profile (for the dictionary approach)
+- `FEATURES_SIZE = 5000`: Number of features, buckets of the hash (for the hashing approach)
+- `LSH_NUM_SKETCHES = 100`: Number of random hyperplanes (signatures/sketches)
+- `LSH_BANDS = 10`: Number of bands for LSH
+- `LSH_ROWS = 10`: Number of rows per band for LSH
+- `RECOMMENDED_ARTICLES = 10`: Number of articles to recommend to each user
 
-= Results
+= Experimental Results and Analysis <results>
 
-- runtime: on my machine, ~15m for 16787 articles and 500000 comments
-- TODO: run for the whole dataset (hashing approach only)
-- visualizing the results is complex as i literally recommend articles to users
-- most of the users receive recommendations (82875 over 91437 users)
-- TODO: why some users do not receive anything? check these ones
-- watching manually some users, it seems that recommendations make sense
-  - TODO: various "categories of users" (a lot of comments, a few comments, ...)
-- more information would certanly benefit the process, for example the articles read (or clicked) by each user
-- with this information, the more assumptions could be made, like open+comment = liked, open but not comment = not liked
+Running the system, playing with the parameters, and looking at the results, some observations can be made.
+
+The dataset is not ideal for this approach, as it does not contain explicit ratings, but only comments.
+Probably a collaborative filtering approach, that does not need explicit ratings, would have performed better.
+
+#vspace
+
+/ Recommendations behavior: The quality of the recommendations is very variable, depending on the user profile.
+  Specifically, the system behaves differently in three cases:
+  - _One topic:_ when the user commented only one article or articles of very similar categories, the recommendations are pretty good, with high similarity.
+  - _Different topics:_ when the user commented on very different things, the recommendations are pretty bad, with low similarity.
+    This is probably due to the fact that the user profile is very noisy, with many different features, and it is hard to find articles that span all those features.
+  - _No recommendations:_ some users do not receive any recommendation ($approx 40%$ with subsampling, $approx 9%$ without subsampling), this can be caused either by subsampling (if the user commented on articles that are not in the subsample, they will not have any profile and thus no recommendation) or by the LSH filter (if the user profile is very noisy, it is unlikely to find any article that passes the filter).
+
+#vspace
+
+/ LSH Threshold: Another problem is posed by the tradeoffs needed to make the system work in a reasonable time for large datasets.
+  By setting a treshold $t approx 0.765$, the pairs that are expected to pass the filter are those with very high similarity.
+  But with complex user profiles, it is really hard to find articles that are similar enough to pass the filter.
+
+  The simple idea of tweaking the parameters to make the filter less strict (increasing the number of bands and decreasing the number of rows) gets into the problem of not being able to reduce the amount of comparisons enough, making the LSH filter ineffective and exploding the computation time.
+
+  The tradeoff made is that very good recommendations are found in a relatively small amount of time, but average recommendations are not found, and many users do not receive any recommendation.
+
+#vspace
+
+/ Scalability: The system runs in a reasonable time on the whole dataset with no subsampling (around $1$ hour) and is designed to scale to even bigger datasets without modification (using the hashing approach).
+  The choice of storing data in a sparse format and the enforcement of never collecting something that could grow to enormous sizes make it possible to process huge datasets without running into memory issues (given that there are many nodes).
 
 #show: appendix.with(title: "Disclaimer")
 
