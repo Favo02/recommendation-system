@@ -10,6 +10,8 @@ The implementation can be found in the [`main.ipynb`](./main.ipynb) notebook, wh
 
 One-click run with Google Colab: <a href="https://colab.research.google.com/github/Favo02/recommendation-system/blob/main/main.ipynb" target="_parent"><img src="https://colab.research.google.com/assets/colab-badge.svg" alt="Open In Colab"/></a>
 
+Compiled Report PDF: [`report.pdf`](./report/report.pdf)
+
 ## Abstract
 
 The project implements a **content-based** recommendation system for news articles using the _New York Times Articles & Comments (2020)_ dataset.
